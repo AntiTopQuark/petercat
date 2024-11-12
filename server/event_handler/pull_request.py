@@ -18,7 +18,9 @@ from agent.prompts.pull_request import get_role_prompt
 from agent.qa_chat import agent_chat
 from core.dao.repositoryConfigDAO import RepositoryConfigDAO
 from petercat_utils.data_class import ChatData, Message, TextContentBlock
-
+from agent.prompts.pull_request_helper import (
+    generate_pr_review_comment_prompt,
+)
 
 def file_match(filename: str, patterns: List[str]):
     return any(fnmatch.fnmatch(filename, pattern) for pattern in patterns)
@@ -125,6 +127,66 @@ class PullRequestEventHandler:
                 return {"success": True}
             else:
                 return {"success": True}
+
+        except GithubException as e:
+            print(f"处理 GitHub 请求时出错：{e}")
+            return {"success": False, "error": str(e)}
+
+class PullRequestReviewCommentEventHandler(PullRequestEventHandler):
+    def not_mentioned_me(self):
+        return "@petercat-assistant" not in self.event["comment"]["body"]
+    
+    async def execute(self):
+        try:
+            print(f"actions={self.event['action']},sender={self.event['sender']}")
+            if self.event["sender"]["type"] == "Bot":
+                return {"success": True}
+            if self.event["action"] in ["created", "edited"]:
+                if self.not_mentioned_me():
+                    return {"success": True}
+
+                pr, file_diff, repo = self.get_pull_request()
+                pr_review_comments = pr.get_review_comments()
+                # TODO by AntiTopQuark： 实现排序，找到本次事件中的
+
+                messages = [
+                    Message(
+                        role="assistant" if comment.user.type == "Bot" else "user",
+                        content=[TextContentBlock(type="text", text=comment.body)],
+                    )
+                    for comment in pr_review_comments
+                ]
+
+                pr_content = f"""
+                ### Pr Title
+                {pr.title}
+                ### Pr Description
+                {pr.body}
+                ### File Diff
+                {file_diff}
+                """
+
+                prompt = generate_pr_review_comment_prompt(
+                    pr_number=pr.number,
+                    pr_content=pr_content,
+                )
+
+                repository_config = RepositoryConfigDAO()
+                repo_config = repository_config.get_by_repo_name(repo.full_name)
+                if repo_config.robot_id:
+                    bot = get_bot_by_id(repo_config.robot_id)
+
+                    analysis_result = await agent_chat(
+                        ChatData(
+                            prompt=f"{bot.prompt}\n{prompt}",
+                            messages=messages,
+                            bot_id=repo_config.robot_id,
+                        ),
+                        self.auth,
+                        bot,
+                    )
+
+                    pr.create_review_comment(analysis_result["output"])
 
         except GithubException as e:
             print(f"处理 GitHub 请求时出错：{e}")
